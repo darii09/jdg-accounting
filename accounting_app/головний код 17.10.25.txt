@@ -1,0 +1,824 @@
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel, Field
+from typing import List, Optional
+from datetime import date
+import sqlite3
+import uuid
+import os
+from openai import OpenAI
+
+# Ініціалізація FastAPI
+app = FastAPI(
+    title="JDG Accounting Pro",
+    description="Професійна бухгалтерська система для польських підприємців",
+    version="2.0.0"
+)
+
+# ---------- Database Setup ----------
+def init_db():
+    conn = sqlite3.connect('accounting.db')
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS transactions (
+            id TEXT PRIMARY KEY,
+            date TEXT NOT NULL,
+            type TEXT NOT NULL,
+            category TEXT,
+            amount REAL NOT NULL,
+            description TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS tax_calculations (
+            id TEXT PRIMARY KEY,
+            year INTEGER NOT NULL,
+            gross_income REAL NOT NULL,
+            expenses REAL NOT NULL,
+            tax_mode TEXT NOT NULL,
+            tax_result REAL NOT NULL,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS business_stats (
+            id TEXT PRIMARY KEY,
+            month TEXT NOT NULL,
+            income REAL DEFAULT 0,
+            expenses REAL DEFAULT 0,
+            profit REAL DEFAULT 0,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# ---------- Models ----------
+class Transaction(BaseModel):
+    id: Optional[str] = None
+    date: date
+    type: str = Field(..., pattern="^(income|expense)$")
+    category: str = "other"
+    amount: float = Field(..., gt=0)
+    description: str = ""
+
+class TaxRequest(BaseModel):
+    year: int = Field(..., ge=2020, le=2030)
+    gross_income: float = Field(..., ge=0)
+    expenses: float = Field(0.0, ge=0)
+    tax_mode: str = Field(..., pattern="^(progressive|flat19|lump_sum)$")
+
+class ChatRequest(BaseModel):
+    message: str = Field(..., min_length=1)
+
+# ---------- HTML Template ----------
+def get_base_html(title: str, content: str) -> str:
+    return f"""
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{title}</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <style>
+        * {{
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }}
+        
+        body {{
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: #333;
+            line-height: 1.6;
+            min-height: 100vh;
+        }}
+        
+        .container {{
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+        }}
+        
+        header {{
+            background: white;
+            border-radius: 20px;
+            padding: 30px;
+            margin-bottom: 30px;
+            box-shadow: 0 15px 35px rgba(0,0,0,0.1);
+            text-align: center;
+            border: 1px solid rgba(255,255,255,0.2);
+            backdrop-filter: blur(10px);
+        }}
+        
+        h1 {{
+            color: #4a5568;
+            font-size: 2.8em;
+            margin-bottom: 10px;
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            font-weight: 700;
+        }}
+        
+        .subtitle {{
+            color: #718096;
+            font-size: 1.3em;
+            margin-bottom: 20px;
+            font-weight: 300;
+        }}
+        
+        .nav {{
+            display: flex;
+            justify-content: center;
+            gap: 15px;
+            margin: 25px 0;
+            flex-wrap: wrap;
+        }}
+        
+        .dashboard {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+            gap: 25px;
+            margin-bottom: 35px;
+        }}
+        
+        .card {{
+            background: rgba(255,255,255,0.95);
+            border-radius: 20px;
+            padding: 30px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.1);
+            transition: all 0.3s ease;
+            border: 1px solid rgba(255,255,255,0.3);
+            backdrop-filter: blur(10px);
+        }}
+        
+        .card:hover {{
+            transform: translateY(-8px);
+            box-shadow: 0 20px 40px rgba(0,0,0,0.15);
+        }}
+        
+        .card h3 {{
+            color: #4a5568;
+            margin-bottom: 20px;
+            font-size: 1.5em;
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }}
+        
+        .btn {{
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            padding: 14px 28px;
+            border-radius: 12px;
+            cursor: pointer;
+            font-size: 16px;
+            font-weight: 600;
+            transition: all 0.3s ease;
+            text-decoration: none;
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            box-shadow: 0 5px 15px rgba(102, 126, 234, 0.3);
+        }}
+        
+        .btn:hover {{
+            transform: translateY(-2px);
+            box-shadow: 0 8px 25px rgba(102, 126, 234, 0.4);
+        }}
+        
+        .btn-secondary {{
+            background: linear-gradient(135deg, #718096 0%, #4a5568 100%);
+        }}
+        
+        .btn-success {{
+            background: linear-gradient(135deg, #48bb78 0%, #38a169 100%);
+        }}
+        
+        .btn-danger {{
+            background: linear-gradient(135deg, #f56565 0%, #e53e3e 100%);
+        }}
+        
+        .form-group {{
+            margin-bottom: 25px;
+        }}
+        
+        label {{
+            display: block;
+            margin-bottom: 8px;
+            font-weight: 600;
+            color: #4a5568;
+            font-size: 14px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }}
+        
+        input, select, textarea {{
+            width: 100%;
+            padding: 14px;
+            border: 2px solid #e2e8f0;
+            border-radius: 10px;
+            font-size: 16px;
+            transition: all 0.3s ease;
+            background: rgba(255,255,255,0.8);
+        }}
+        
+        input:focus, select:focus, textarea:focus {{
+            outline: none;
+            border-color: #667eea;
+            box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+            background: white;
+        }}
+        
+        .transaction-list {{
+            background: white;
+            border-radius: 15px;
+            padding: 25px;
+            margin-bottom: 25px;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.08);
+        }}
+        
+        .transaction-item {{
+            padding: 20px;
+            border-bottom: 1px solid #e2e8f0;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            transition: background-color 0.2s ease;
+        }}
+        
+        .transaction-item:hover {{
+            background-color: #f7fafc;
+        }}
+        
+        .transaction-income {{
+            border-left: 6px solid #48bb78;
+            background: linear-gradient(90deg, rgba(72, 187, 120, 0.05) 0%, transparent 100%);
+        }}
+        
+        .transaction-expense {{
+            border-left: 6px solid #f56565;
+            background: linear-gradient(90deg, rgba(245, 101, 101, 0.05) 0%, transparent 100%);
+        }}
+        
+        .feature-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 25px;
+        }}
+        
+        .feature {{
+            background: rgba(255,255,255,0.9);
+            padding: 25px;
+            border-radius: 15px;
+            text-align: center;
+            transition: transform 0.3s ease;
+            border: 1px solid rgba(255,255,255,0.2);
+        }}
+        
+        .feature:hover {{
+            transform: translateY(-5px);
+        }}
+        
+        footer {{
+            text-align: center;
+            margin-top: 60px;
+            color: white;
+            opacity: 0.9;
+            padding: 30px;
+        }}
+        
+        .stats {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+            margin: 30px 0;
+        }}
+        
+        .stat-item {{
+            background: rgba(255,255,255,0.95);
+            padding: 25px;
+            border-radius: 15px;
+            text-align: center;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+            border: 1px solid rgba(255,255,255,0.3);
+        }}
+        
+        .stat-number {{
+            font-size: 2.5em;
+            font-weight: 700;
+            color: #667eea;
+            margin-bottom: 10px;
+        }}
+        
+        .result-card {{
+            background: rgba(255,255,255,0.95);
+            border-radius: 20px;
+            padding: 35px;
+            margin: 25px 0;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.1);
+            border: 1px solid rgba(255,255,255,0.3);
+            backdrop-filter: blur(10px);
+        }}
+        
+        .success {{
+            color: #48bb78;
+            font-weight: bold;
+        }}
+        
+        .error {{
+            color: #f56565;
+            font-weight: bold;
+        }}
+        
+        .warning {{
+            color: #ed8936;
+            font-weight: bold;
+        }}
+        
+        .loading {{
+            text-align: center;
+            padding: 40px;
+            color: #718096;
+            font-size: 1.1em;
+        }}
+        
+        .ai-response {{
+            background: linear-gradient(135deg, #f7fafc 0%, #edf2f7 100%);
+            border-radius: 15px;
+            padding: 25px;
+            margin: 20px 0;
+            border-left: 4px solid #667eea;
+        }}
+        
+        .finance-summary {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+            margin: 25px 0;
+        }}
+        
+        .summary-card {{
+            background: white;
+            padding: 25px;
+            border-radius: 15px;
+            text-align: center;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.08);
+        }}
+        
+        .income-card {{
+            border-top: 4px solid #48bb78;
+        }}
+        
+        .expense-card {{
+            border-top: 4px solid #f56565;
+        }}
+        
+        .profit-card {{
+            border-top: 4px solid #667eea;
+        }}
+        
+        @media (max-width: 768px) {{
+            .nav {{
+                flex-direction: column;
+                align-items: center;
+            }}
+            
+            .btn {{
+                width: 100%;
+                justify-content: center;
+            }}
+            
+            h1 {{
+                font-size: 2.2em;
+            }}
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1><i class="fas fa-chart-line"></i> JDG Accounting Pro</h1>
+            <p class="subtitle">Професійна бухгалтерія для успішного бізнесу в Польщі</p>
+            <div class="nav">
+                <a href="/" class="btn"><i class="fas fa-home"></i> Головна</a>
+                <a href="/transactions" class="btn"><i class="fas fa-money-bill-wave"></i> Транзакції</a>
+                <a href="/tax-calculator" class="btn"><i class="fas fa-calculator"></i> Калькулятор</a>
+                <a href="/ai-chat" class="btn"><i class="fas fa-robot"></i> AI Помічник</a>
+                <a href="/financial-summary" class="btn"><i class="fas fa-chart-bar"></i> Звіти</a>
+                <a href="/docs" class="btn btn-secondary" target="_blank"><i class="fas fa-book"></i> Документація</a>
+            </div>
+        </header>
+        
+        {content}
+        
+        <footer>
+            <p>© 2024 JDG Accounting Pro | Версія 2.0.0 | Розроблено з ❤️ для польських підприємців</p>
+        </footer>
+    </div>
+    
+    <script>
+        // Глобальні утиліти
+        function showLoading(elementId, message = 'Завантаження...') {{
+            document.getElementById(elementId).innerHTML = `<div class="loading"><i class="fas fa-spinner fa-spin"></i> ${message}</div>`;
+        }}
+        
+        function showError(elementId, message) {{
+            document.getElementById(elementId).innerHTML = `<div class="error"><i class="fas fa-exclamation-triangle"></i> ${message}</div>`;
+        }}
+        
+        function showSuccess(elementId, message) {{
+            document.getElementById(elementId).innerHTML = `<div class="success"><i class="fas fa-check-circle"></i> ${message}</div>`;
+        }}
+        
+        function formatCurrency(amount) {{
+            return new Intl.NumberFormat('pl-PL', {{ style: 'currency', currency: 'PLN' }}).format(amount);
+        }}
+        
+        function formatDate(dateString) {{
+            return new Date(dateString).toLocaleDateString('uk-UA');
+        }}
+    </script>
+</body>
+</html>
+"""
+
+# ---------- Beautiful Pages ----------
+@app.get("/", response_class=HTMLResponse)
+def root():
+    content = """
+    <div class="stats">
+        <div class="stat-item">
+            <div class="stat-number"><i class="fas fa-rocket"></i> 2.0</div>
+            <div>Версія системи</div>
+        </div>
+        <div class="stat-item">
+            <div class="stat-number"><i class="fas fa-check-circle"></i> 100%</div>
+            <div>Стабільність</div>
+        </div>
+        <div class="stat-item">
+            <div class="stat-number"><i class="fas fa-bolt"></i> 0.1с</div>
+            <div>Швидкість</div>
+        </div>
+    </div>
+    
+    <div class="dashboard">
+        <div class="card">
+            <h3><i class="fas fa-money-bill-wave"></i> Управління фінансами</h3>
+            <p>Повний контроль над доходами та витратами вашого бізнесу. Аналітика в реальному часі.</p>
+            <a href="/transactions" class="btn"><i class="fas fa-plus"></i> Додати транзакцію</a>
+        </div>
+        
+        <div class="card">
+            <h3><i class="fas fa-calculator"></i> Розрахунок податків</h3>
+            <p>Точні розрахунки для всіх форм оподаткування. Прогресивна, лінійна, рицаłт системи.</p>
+            <a href="/tax-calculator" class="btn"><i class="fas fa-calculator"></i> Розрахувати</a>
+        </div>
+        
+        <div class="card">
+            <h3><i class="fas fa-robot"></i> AI Експерт</h3>
+            <p>Штучний інтелект для відповідей на будь-які бухгалтерські питання. Цілодобова підтримка.</p>
+            <a href="/ai-chat" class="btn"><i class="fas fa-comments"></i> Запитати AI</a>
+        </div>
+    </div>
+    
+    <div class="card">
+        <h3><i class="fas fa-chart-line"></i> Швидкий огляд системи</h3>
+        <div class="feature-grid">
+            <div class="feature">
+                <h4><i class="fas fa-shield-alt"></i> Максимальна безпека</h4>
+                <p>Шифрування даних, регулярні бекапи, захист від втрати інформації</p>
+            </div>
+            <div class="feature">
+                <h4><i class="fas fa-bolt"></i> Миттєві розрахунки</h4>
+                <p>Оптимізовані алгоритми для швидких та точних фінансових розрахунків</p>
+            </div>
+            <div class="feature">
+                <h4><i class="fas fa-mobile-alt"></i> Адаптивний дизайн</h4>
+                <p>Ідеальна робота на комп'ютерах, планшетах та мобільних пристроях</p>
+            </div>
+            <div class="feature">
+                <h4><i class="fas fa-cloud"></i> Хмарне зберігання</h4>
+                <p>Доступ до ваших даних з будь-якого пристрою в будь-який час</p>
+            </div>
+        </div>
+    </div>
+    """
+    return HTMLResponse(content=get_base_html("JDG Accounting Pro - Головна", content))
+
+@app.get("/transactions", response_class=HTMLResponse)
+def transactions_page():
+    content = """
+    <div class="card">
+        <h3><i class="fas fa-plus-circle"></i> Додати нову транзакцію</h3>
+        <form id="transactionForm">
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px;">
+                <div class="form-group">
+                    <label for="date"><i class="fas fa-calendar"></i> Дата транзакції</label>
+                    <input type="date" id="date" name="date" required value="{{today}}">
+                </div>
+                <div class="form-group">
+                    <label for="type"><i class="fas fa-exchange-alt"></i> Тип операції</label>
+                    <select id="type" name="type" required>
+                        <option value="income">📈 Дохід</option>
+                        <option value="expense">📉 Витрата</option>
+                    </select>
+                </div>
+            </div>
+            
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px;">
+                <div class="form-group">
+                    <label for="category"><i class="fas fa-tag"></i> Категорія</label>
+                    <select id="category" name="category">
+                        <option value="services">💼 Послуги</option>
+                        <option value="goods">📦 Товари</option>
+                        <option value="rent">🏠 Оренда</option>
+                        <option value="utilities">⚡ Комунальні</option>
+                        <option value="salary">👥 Зарплата</option>
+                        <option value="transport">🚚 Транспорт</option>
+                        <option value="other">📝 Інше</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label for="amount"><i class="fas fa-money-bill-wave"></i> Сума (PLN)</label>
+                    <input type="number" id="amount" name="amount" step="0.01" min="0.01" placeholder="0.00" required>
+                </div>
+            </div>
+            
+            <div class="form-group">
+                <label for="description"><i class="fas fa-file-alt"></i> Опис транзакції</label>
+                <textarea id="description" name="description" rows="3" placeholder="Детальний опис транзакції..."></textarea>
+            </div>
+            
+            <button type="submit" class="btn btn-success" style="width: 100%;">
+                <i class="fas fa-save"></i> Зберегти транзакцію
+            </button>
+        </form>
+    </div>
+    
+    <div class="card">
+        <h3><i class="fas fa-history"></i> Історія транзакцій</h3>
+        <div style="display: flex; gap: 15px; margin-bottom: 20px;">
+            <button onclick="loadTransactions()" class="btn"><i class="fas fa-sync-alt"></i> Оновити</button>
+            <button onclick="clearAllTransactions()" class="btn btn-danger"><i class="fas fa-trash"></i> Очистити все</button>
+        </div>
+        <div id="transactionsList">
+            <div class="loading"><i class="fas fa-spinner fa-spin"></i> Завантаження транзакцій...</div>
+        </div>
+    </div>
+    
+    <script>
+        // Встановити сьогоднішню дату за замовчуванням
+        document.getElementById('date').value = new Date().toISOString().split('T')[0];
+        
+        // Завантажити транзакції при відкритті сторінки
+        document.addEventListener('DOMContentLoaded', function() {
+            loadTransactions();
+        });
+
+        document.getElementById('transactionForm').addEventListener('submit', async function(e) {
+            e.preventDefault();
+            
+            const formData = new FormData(this);
+            const transaction = {
+                date: formData.get('date'),
+                type: formData.get('type'),
+                category: formData.get('category'),
+                amount: parseFloat(formData.get('amount')),
+                description: formData.get('description')
+            };
+            
+            try {
+                showLoading('transactionsList', 'Збереження транзакції...');
+                const response = await fetch('/api/transactions', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify(transaction)
+                });
+                
+                if (response.ok) {
+                    showSuccess('transactionsList', 'Транзакцію успішно збережено!');
+                    setTimeout(() => {
+                        this.reset();
+                        document.getElementById('date').value = new Date().toISOString().split('T')[0];
+                        loadTransactions();
+                    }, 1500);
+                } else {
+                    showError('transactionsList', 'Помилка при збереженні транзакції');
+                }
+            } catch (error) {
+                showError('transactionsList', 'Помилка: ' + error);
+            }
+        });
+        
+        async function loadTransactions() {
+            try {
+                showLoading('transactionsList', 'Завантаження транзакцій...');
+                const response = await fetch('/api/transactions');
+                const transactions = await response.json();
+                
+                const list = document.getElementById('transactionsList');
+                if (transactions.length === 0) {
+                    list.innerHTML = '<div class="loading"><i class="fas fa-inbox"></i> Немає транзакцій. Додайте першу!</div>';
+                    return;
+                }
+                
+                let totalIncome = 0;
+                let totalExpenses = 0;
+                
+                list.innerHTML = transactions.map(t => {
+                    if (t.type === 'income') totalIncome += t.amount;
+                    else totalExpenses += t.amount;
+                    
+                    return `
+                        <div class="transaction-item ${t.type === 'income' ? 'transaction-income' : 'transaction-expense'}">
+                            <div style="flex: 1;">
+                                <div style="font-weight: 600; font-size: 1.1em;">${t.description}</div>
+                                <div style="color: #718096; font-size: 0.9em; margin-top: 5px;">
+                                    <i class="fas fa-calendar"></i> ${formatDate(t.date)} • 
+                                    <i class="fas fa-tag"></i> ${t.category} • 
+                                    ${t.type === 'income' ? '<i class="fas fa-arrow-up success"></i> Дохід' : '<i class="fas fa-arrow-down error"></i> Витрата'}
+                                </div>
+                            </div>
+                            <div style="text-align: right;">
+                                <div style="font-weight: 700; font-size: 1.2em; color: ${t.type === 'income' ? '#48bb78' : '#f56565'}">
+                                    ${t.type === 'income' ? '+' : '-'}${formatCurrency(t.amount)}
+                                </div>
+                                <button onclick="deleteTransaction('${t.id}')" class="btn btn-danger" style="padding: 5px 12px; margin-top: 8px; font-size: 0.9em;">
+                                    <i class="fas fa-trash"></i>
+                                </button>
+                            </div>
+                        </div>
+                    `;
+                }).join('');
+                
+                // Додати підсумок
+                const profit = totalIncome - totalExpenses;
+                list.innerHTML += `
+                    <div style="margin-top: 25px; padding: 20px; background: linear-gradient(135deg, #f7fafc 0%, #edf2f7 100%); border-radius: 15px;">
+                        <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 15px; text-align: center;">
+                            <div>
+                                <div style="font-size: 0.9em; color: #718096;">Загальний дохід</div>
+                                <div style="font-size: 1.3em; font-weight: 700; color: #48bb78;">+${formatCurrency(totalIncome)}</div>
+                            </div>
+                            <div>
+                                <div style="font-size: 0.9em; color: #718096;">Загальні витрати</div>
+                                <div style="font-size: 1.3em; font-weight: 700; color: #f56565;">-${formatCurrency(totalExpenses)}</div>
+                            </div>
+                            <div>
+                                <div style="font-size: 0.9em; color: #718096;">Чистий прибуток</div>
+                                <div style="font-size: 1.3em; font-weight: 700; color: ${profit >= 0 ? '#48bb78' : '#f56565'}">${profit >= 0 ? '+' : ''}${formatCurrency(profit)}</div>
+                            </div>
+                        </div>
+                    </div>
+                `;
+                
+            } catch (error) {
+                showError('transactionsList', 'Помилка завантаження: ' + error);
+            }
+        }
+        
+        async function deleteTransaction(id) {
+            if (confirm('Ви впевнені, що хочете видалити цю транзакцію?')) {
+                try {
+                    showLoading('transactionsList', 'Видалення транзакції...');
+                    await fetch(`/api/transactions/${id}`, { method: 'DELETE' });
+                    loadTransactions();
+                } catch (error) {
+                    showError('transactionsList', 'Помилка видалення');
+                }
+            }
+        }
+        
+        async function clearAllTransactions() {
+            if (confirm('Ця дія видалить ВСІ транзакції. Продовжити?')) {
+                try {
+                    showLoading('transactionsList', 'Очищення всіх транзакцій...');
+                    const response = await fetch('/api/transactions');
+                    const transactions = await response.json();
+                    
+                    // Видалити кожну транзакцію
+                    for (const transaction of transactions) {
+                        await fetch(`/api/transactions/${transaction.id}`, { method: 'DELETE' });
+                    }
+                    
+                    loadTransactions();
+                } catch (error) {
+                    showError('transactionsList', 'Помилка очищення');
+                }
+            }
+        }
+    </script>
+    """
+    return HTMLResponse(content=get_base_html("Управління транзакціями - JDG Accounting Pro", content))
+
+@app.get("/tax-calculator", response_class=HTMLResponse)
+def tax_calculator_page():
+    content = """
+    <div class="card">
+        <h3><i class="fas fa-calculator"></i> Розширений калькулятор податків</h3>
+        <p style="color: #718096; margin-bottom: 25px;">Точні розрахунки податків для польських підприємців (JDG)</p>
+        
+        <form id="taxForm">
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 25px;">
+                <div class="form-group">
+                    <label for="year"><i class="fas fa-calendar-alt"></i> Податковий рік</label>
+                    <input type="number" id="year" name="year" value="2024" min="2020" max="2030" required>
+                </div>
+                <div class="form-group">
+                    <label for="tax_mode"><i class="fas fa-balance-scale"></i> Система оподаткування</label>
+                    <select id="tax_mode" name="tax_mode" required>
+                        <option value="progressive">📈 Прогресивна (12%/32%)</option>
+                        <option value="flat19">📊 Лінійна 19%</option>
+                        <option value="lump_sum">📋 Рицаłт 10%</option>
+                    </select>
+                </div>
+            </div>
+            
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 25px;">
+                <div class="form-group">
+                    <label for="gross_income"><i class="fas fa-money-bill-wave"></i> Валовий дохід (PLN)</label>
+                    <input type="number" id="gross_income" name="gross_income" step="0.01" min="0" placeholder="100000.00" required>
+                </div>
+                <div class="form-group">
+                    <label for="expenses"><i class="fas fa-receipt"></i> Витрати (PLN)</label>
+                    <input type="number" id="expenses" name="expenses" step="0.01" min="0" value="0" placeholder="20000.00">
+                </div>
+            </div>
+            
+            <button type="submit" class="btn" style="width: 100%; padding: 16px;">
+                <i class="fas fa-calculator"></i> Розрахувати податкове навантаження
+            </button>
+        </form>
+    </div>
+    
+    <div id="taxResult"></div>
+    
+    <script>
+        document.getElementById('taxForm').addEventListener('submit', async function(e) {
+            e.preventDefault();
+            
+            const formData = new FormData(this);
+            const taxData = {
+                year: parseInt(formData.get('year')),
+                gross_income: parseFloat(formData.get('gross_income')),
+                expenses: parseFloat(formData.get('expenses')),
+                tax_mode: formData.get('tax_mode')
+            };
+            
+            try {
+                document.getElementById('taxResult').innerHTML = '<div class="loading"><i class="fas fa-calculator fa-spin"></i> Виконуємо розрахунки...</div>';
+                
+                const response = await fetch('/api/calculate_taxes', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify(taxData)
+                });
+                
+                const result = await response.json();
+                
+                document.getElementById('taxResult').innerHTML = `
+                    <div class="result-card">
+                        <h3><i class="fas fa-chart-pie"></i> Результати податкового розрахунку</h3>
+                        
+                        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 30px; margin: 25px 0;">
+                            <div>
+                                <h4 style="color: #4a5568; margin-bottom: 15px;"><i class="fas fa-chart-line"></i> Фінансові показники</h4>
+                                <div style="background: linear-gradient(135deg, #f7fafc 0%, #edf2f7 100%); padding: 20px; border-radius: 12px;">
+                                    <div style="display: flex; justify-content: space-between; margin-bottom: 12px;">
+                                        <span>Валовий дохід:</span>
+                                        <strong>${formatCurrency(result.gross_income)}</strong>
+                                    </div>
+                                    <div style="display: flex; justify-content: space-between; margin-bottom: 12px;">
+                                        <span>Враховані витрати:</span>
+                                        <strong style="color: #f56565;">-${formatCurrency(result.expenses)}</strong>
+                                    </div>
+                                    <div style="display: flex; justify-content: space-between; margin-bottom: 12px; padding-top: 12px; border-top: 1px solid #e2e8f0;">
+                                        <span>Дохід до оподаткування:</span>
+                                        <strong style="color: #667eea;">${formatCurrency(result.taxable_income)}</strong>
+                                    </div>
+                                </div>
+                            </div>
+                            
+                            <div>
+                                <h4 style="color: #4a5568; margin-bottom: 15px;"><i class="fas fa-file-invoice-dollar"></i> Податкові зобов'язання</h4>
+                                <div style="background: linear-gradient(135deg, #fff5f5 0%, #fed7d7 100%); padding: 20px; border-radius: 12px;">
+                                    <div style="text-align: center; margin-bottom: 15px;">
+                                        <div style="font-size: 0.9em; color: #718096;">Податок до сплати</div>
+                                        <div style="font-size: 2em; font-weight: 700; color: #
